@@ -1,4 +1,103 @@
 
+## TODO: Selection as UI-only, Full File as Context
+
+| Aspect | Current Behavior | Desired Behavior |
+|--------|------------------|------------------|
+| Selection | Sent as context + replaced | UI only (highlight, spinner) |
+| Context | Selected text | Entire file |
+| Replacement | Replaces selection | Still replaces selection |
+| UI (highlight) | On selection | Same |
+| UI (spinner) | End of selection | Same |
+
+### Use Case
+User selects a function but wants Claude to see the whole file for context (imports, types, related functions) while still replacing only the selection.
+
+### Proposed API
+
+```lua
+-- Option 1: Flag in opts
+M.replace(args, { context = "file" })  -- vs default "selection"
+
+-- Option 2: Separate command
+vim.api.nvim_create_user_command("ClaudeFile", function(args)
+  M.replace(args, { context = "file" })
+end, { range = true, nargs = "*" })
+
+-- Option 3: Context builder function
+M.replace(args, {
+  context = function(selection, bufnr)
+    return vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  end
+})
+```
+
+### Prompt Structure
+
+```
+[user prompt]
+
+File: [filename]
+```lua
+[entire file content]
+```
+
+Selection (lines X-Y):
+```lua
+[selected text - for reference only]
+```
+```
+
+---
+
+## Claude Code Permissions Model
+
+| Factor | Location | Scope | Notes |
+|--------|----------|-------|-------|
+| `cwd` (plugin default) | `plugin_dir` | Plugin only | Claude can only access files within plugin directory |
+| `cwd` (user override) | `opts.project` | Custom | User sets via `setup({ project = "..." })` |
+| Project settings | `<cwd>/.claude/settings.json` | Per-project | Checked in, shared with team |
+| User settings | `~/.claude/settings.local.json` | Global user | Personal overrides, not checked in |
+| Env var | `CLAUDE_CONFIG_DIR` | Global | Override config directory location |
+
+### Permission Resolution Order
+
+1. **User local** (`~/.claude/settings.local.json`) - highest priority
+2. **Project** (`<cwd>/.claude/settings.json`) - project-specific
+3. **Defaults** - Claude's built-in defaults
+
+### Common User Scenarios
+
+| Scenario | Solution |
+|----------|----------|
+| User wants Claude to access their whole project | `setup({ project = vim.fn.getcwd() })` |
+| User wants to use their global permissions | Permissions from `~/.claude/settings.local.json` always apply |
+| User wants plugin-scoped Claude (safe) | Default behavior (`project = plugin_dir`) |
+| User wants to allow specific tools | Add to `allowedTools` in settings.local.json |
+
+### Example: User Settings Override
+
+```json
+// ~/.claude/settings.local.json
+{
+  "permissions": {
+    "allowedTools": ["Read", "Glob", "Grep", "Bash(git *)"],
+    "deniedTools": ["Write", "Edit"]
+  }
+}
+```
+
+### Plugin Config Example
+
+```lua
+require("run-ai-run").setup({
+  -- Use current working directory instead of plugin dir
+  project = vim.fn.getcwd(),
+  -- Or use a specific project root
+  -- project = vim.fn.finddir(".git/..", vim.fn.expand("%:p:h") .. ";"),
+})
+```
+
+---
 
 how to handle searching  with **permissions** using claude:
 

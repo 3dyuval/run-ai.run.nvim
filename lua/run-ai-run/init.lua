@@ -11,14 +11,9 @@ M.config = {
 	project = plugin_dir,
 	log_level = "debug",
 	notify_level = "error", -- nil = off, "debug"/"info"/"warn"/"error" = show in noice
-	spinner = {
-		normal = "dots",
-		thinking = "moon",
-	},
-	highlights = {
-		normal = "DiagnosticInfo",
-		thinking = "DiagnosticHint",
-	},
+	spinner = "dots",
+	highlight = "DiagnosticInfo",
+	skills_path = nil, -- path to user's .claude/skills directory
 }
 
 local log
@@ -73,23 +68,23 @@ function M.setup(opts)
 
 	-- Create commands
 	vim.api.nvim_create_user_command("Claude", function(args)
-		M.replace(args, false)
+		M.replace(args)
 	end, {
 		range = true,
 		nargs = "*",
 		desc = "Replace selection with Claude response",
 	})
 
-	vim.api.nvim_create_user_command("ClaudeThink", function(args)
-		M.replace(args, true)
+	vim.api.nvim_create_user_command("ClaudeContinue", function(args)
+		M.replace(args, { continue = true })
 	end, {
 		range = true,
 		nargs = "*",
-		desc = "Replace selection with Claude response (extended thinking)",
+		desc = "Replace selection with Claude response (--continue flag)",
 	})
 
-	vim.api.nvim_create_user_command("ClaudeThinkClaude", function(args)
-		M.replace(args, true, {
+	vim.api.nvim_create_user_command("ClaudeSkillClaude", function(args)
+		M.replace(args, {
 			skill = plugin_dir .. "/.claude/skills/run-ai-run.nvim.md",
 		})
 	end, {
@@ -97,21 +92,51 @@ function M.setup(opts)
 		nargs = "*",
 		desc = "Replace selection with Claude using run-ai-run skill",
 	})
+
+	-- Load user skills from skills_path
+	if M.config.skills_path then
+		M.load_skills(M.config.skills_path)
+	end
+end
+
+--- Load skills from a directory and create commands for each
+---@param skills_path string Path to the skills directory
+function M.load_skills(skills_path)
+	local path = vim.fn.expand(skills_path)
+	if vim.fn.isdirectory(path) ~= 1 then
+		notify("warn", "Skills path not found: " .. path)
+		return
+	end
+
+	local files = vim.fn.glob(path .. "/*.md", false, true)
+	for _, file in ipairs(files) do
+		local name = vim.fn.fnamemodify(file, ":t:r") -- filename without extension
+		local cmd_name = "ClaudeSkill" .. name:gsub("[^%w]", ""):gsub("^%l", string.upper)
+
+		vim.api.nvim_create_user_command(cmd_name, function(args)
+			M.replace(args, { skill = file })
+		end, {
+			range = true,
+			nargs = "*",
+			desc = "Replace selection with Claude using " .. name .. " skill",
+		})
+
+		notify("info", "Loaded skill: " .. name .. " -> :" .. cmd_name)
+	end
 end
 
 --- Run Claude with prompt and callbacks (no UI)
 ---@param prompt string The prompt to send
----@param opts? table Options: continue_thinking, on_success, on_error, on_stdout, bin, project
+---@param opts? table Options: continue, on_success, on_error, on_stdout, bin, project
 ---@return table job The plenary job object
 function M.run(prompt, opts)
 	opts = opts or {}
 	local cfg = vim.tbl_deep_extend("force", M.config, opts)
 
 	local out = {}
-	local thinking = {}
 
 	local job_args = { "-p", prompt }
-	if opts.continue_thinking then
+	if opts.continue then
 		table.insert(job_args, "--continue")
 	end
 
@@ -137,18 +162,11 @@ function M.run(prompt, opts)
 			end
 
 			notify("debug", "stdout: " .. data:sub(1, 100))
-
-			local is_thinking = opts.continue_thinking and (data:match("^thinking:") or data:match("^<thinking>"))
-
-			if is_thinking then
-				table.insert(thinking, data)
-			else
-				table.insert(out, data)
-			end
+			table.insert(out, data)
 
 			if opts.on_stdout then
 				vim.schedule(function()
-					opts.on_stdout(data, is_thinking)
+					opts.on_stdout(data)
 				end)
 			end
 		end,
@@ -174,7 +192,7 @@ function M.run(prompt, opts)
 				notify("info", "Success: " .. #out .. " lines")
 
 				if opts.on_success then
-					opts.on_success(result, thinking)
+					opts.on_success(result)
 				end
 			end)
 		end,
@@ -187,9 +205,8 @@ end
 
 --- Replace visual selection with Claude response (with UI)
 ---@param args table Command args
----@param continue_thinking boolean Use extended thinking mode
----@param opts? table Options: skill (path to skill file)
-function M.replace(args, continue_thinking, opts)
+---@param opts? table Options: skill (path to skill file), continue (use --continue flag)
+function M.replace(args, opts)
 	opts = opts or {}
 
 	local query = args.args
@@ -233,9 +250,8 @@ function M.replace(args, continue_thinking, opts)
 	local running = true
 	local timer = nil
 
-	-- Highlight config
-	local hl = continue_thinking and M.config.highlights.thinking or M.config.highlights.normal
-	local spinner_type = continue_thinking and M.config.spinner.thinking or M.config.spinner.normal
+	local hl = M.config.highlight
+	local spinner_type = M.config.spinner
 
 	-- Highlight selected text
 	local selection_marks = {}
@@ -291,12 +307,12 @@ function M.replace(args, continue_thinking, opts)
 
 	-- Run Claude
 	M.run(prompt, {
-		continue_thinking = continue_thinking,
-		on_stdout = function(data, is_thinking)
+		continue = opts.continue,
+		on_stdout = function(data)
 			if not running or not vim.api.nvim_buf_is_valid(bufnr) then
 				return
 			end
-			local display = is_thinking and data:gsub("^thinking:", ""):gsub("^<thinking>", "") or data
+			local display = data
 			if #display > 50 then
 				display = display:sub(1, 50) .. "..."
 			end
@@ -306,7 +322,7 @@ function M.replace(args, continue_thinking, opts)
 				virt_text_pos = "eol",
 			})
 		end,
-		on_success = function(result, thinking_lines)
+		on_success = function(result)
 			cleanup()
 			local new = vim.split(result, "\n", { plain = true })
 			if vim.api.nvim_buf_is_valid(bufnr) then
@@ -315,15 +331,19 @@ function M.replace(args, continue_thinking, opts)
 				vim.api.nvim_buf_set_text(bufnr, sl, sc, el, end_col, new)
 				notify("info", "Replaced with " .. #new .. " lines")
 			end
-			if continue_thinking and #thinking_lines > 0 then
-				notify("info", "Thinking: " .. #thinking_lines .. " lines")
-			end
 		end,
 		on_error = function(err)
 			cleanup()
 			vim.notify("run-ai-run: " .. err, vim.log.levels.ERROR)
 		end,
 	})
+end
+
+--- Create a job (wrapper around plenary.job)
+---@param opts table Same options as plenary.job
+---@return table job The plenary job object
+function M.job(opts)
+	return Job:new(opts)
 end
 
 return M
