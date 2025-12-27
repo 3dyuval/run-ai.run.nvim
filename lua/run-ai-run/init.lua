@@ -203,6 +203,23 @@ function M.run(prompt, opts)
 	return job
 end
 
+--- Strip markdown code fences from result if present
+---@param text string
+---@return string
+local function strip_markdown_fences(text)
+	-- Match ```lang\n...\n``` pattern
+	local stripped = text:match("^```[^\n]*\n(.-)\n```%s*$")
+	if stripped then
+		return stripped
+	end
+	-- Match ```\n...\n``` pattern (no language)
+	stripped = text:match("^```\n(.-)\n```%s*$")
+	if stripped then
+		return stripped
+	end
+	return text
+end
+
 --- Replace visual selection with Claude response (with UI)
 ---@param args table Command args
 ---@param opts? table Options: skill (path to skill file), continue (use --continue flag)
@@ -324,6 +341,7 @@ function M.replace(args, opts)
 		end,
 		on_success = function(result)
 			cleanup()
+			result = strip_markdown_fences(result)
 			local new = vim.split(result, "\n", { plain = true })
 			if vim.api.nvim_buf_is_valid(bufnr) then
 				local end_line = vim.api.nvim_buf_get_lines(bufnr, el, el + 1, false)[1] or ""
