@@ -96,6 +96,12 @@ local function platform_lib()
   return "linux-x64", "libliter_llm_ffi.so"
 end
 
+--- Resolve the user cache directory (populated by download.lua)
+---@return string
+local function cache_lib_dir()
+  return vim.fn.stdpath("data") .. "/run-ai-run/lib"
+end
+
 --- Load the shared library
 ---@param lib_path? string Path to libliter_llm.so/dylib/dll (auto-detected if nil)
 ---@return ffi.namespace*
@@ -104,20 +110,31 @@ function M.load(lib_path)
     return ffi.load(lib_path)
   end
 
-  -- Try bundled lib first
   local subdir, filename = platform_lib()
+
+  -- 1. Bundled (shipped with plugin, gitignored for size)
   local bundled = bundled_lib_dir() .. "/" .. subdir .. "/" .. filename
   local ok, lib = pcall(ffi.load, bundled)
   if ok then return lib end
 
-  -- Try system-installed
+  -- 2. User cache (downloaded at runtime via M.ensure())
+  local cached = cache_lib_dir() .. "/" .. subdir .. "/" .. filename
+  ok, lib = pcall(ffi.load, cached)
+  if ok then return lib end
+
+  -- 3. System-installed
   local names = { "liter_llm_ffi", "liter_llm", "libliter_llm" }
   for _, name in ipairs(names) do
     ok, lib = pcall(ffi.load, name)
     if ok then return lib end
   end
 
-  error("Could not load liter-llm shared library.\nTried bundled: " .. bundled .. "\nInstall it or pass lib_path explicitly.")
+  error(
+    "liter-llm shared library not found.\n"
+    .. "Tried bundled: " .. bundled .. "\n"
+    .. "Tried cache:   " .. cached .. "\n"
+    .. "Call require('run-ai-run.liter').ensure(url, callback) to download it."
+  )
 end
 
 return M

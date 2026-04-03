@@ -13,6 +13,7 @@
 local ffi = require("ffi")
 local ffi_loader = require("run-ai-run.liter.ffi")
 local errors = require("run-ai-run.liter.errors")
+local downloader = require("run-ai-run.liter.download")
 
 ---@class liter_llm.Client
 ---@field private _handle ffi.cdata*
@@ -278,7 +279,36 @@ function M.version(lib_path)
   return ffi.string(ptr)
 end
 
+--- Ensure the shared library is present, downloading it if needed.
+--- Shows a floating progress buffer during download.
+---@param url string  URL of the platform .so/.dylib/.dll to download
+---@param callback fun(liter: table)  Called with this module once the lib is ready
+---@param on_err? fun(msg: string)    Optional error handler (defaults to vim.notify)
+function M.ensure(url, callback, on_err)
+  on_err = on_err or function(msg)
+    vim.notify(msg, vim.log.levels.ERROR)
+  end
+
+  if downloader.is_cached() then
+    callback(M)
+    return
+  end
+
+  -- Also accept if bundled or system lib loads fine
+  local ok = pcall(ffi_loader.load)
+  if ok then
+    callback(M)
+    return
+  end
+
+  downloader.download(url, function(_path)
+    callback(M)
+  end, on_err)
+end
+
 --- Re-export errors module
 M.errors = errors
+--- Re-export download helpers
+M.download = downloader
 
 return M
