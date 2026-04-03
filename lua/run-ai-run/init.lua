@@ -5,363 +5,399 @@ local ns = vim.api.nvim_create_namespace("run_ai_run")
 -- Get plugin root directory
 local plugin_dir = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h:h:h")
 
+--- liter-llm binding passthrough
+--- Access via require("run-ai-run").liter or require("run-ai-run.liter")
+M.liter = require("run-ai-run.liter")
+
 -- Default configuration
 M.config = {
-	bin = "/home/yuv/.nvm/versions/node/v20.19.6/bin/claude",
-	project = plugin_dir,
-	log_level = "debug",
-	notify_level = "error", -- nil = off, "debug"/"info"/"warn"/"error" = show in noice
-	spinner = "dots",
-	highlight = "DiagnosticInfo",
-	skills_path = nil, -- path to user's .claude/skills directory
+  log_level = "debug",
+  notify_level = "error",
+  spinner = "dots",
+  highlight = "DiagnosticInfo",
+  skills_path = nil,
+  on_sent = nil, -- optional callback fired after prompt is sent
+
+  --- liter-llm provider configs to register on setup
+  ---@type liter_llm.CustomProvider[]?
+  providers = nil,
+
+  --- liter-llm client options — creates a shared client accessible via M.client
+  ---@type liter_llm.ClientOptions?
+  liter = nil,
+
+  --- Path to liter-llm shared library (auto-detected if nil)
+  ---@type string?
+  lib_path = nil,
 }
 
+--- Shared liter-llm client instance, created during setup if config.liter is set
+---@type liter_llm.Client?
+M.client = nil
+
 local log
-local Job
 local spinners
 
 -- Log level priority for filtering
 local levels = { debug = 1, info = 2, warn = 3, error = 4 }
 local vim_levels = {
-	debug = vim.log.levels.DEBUG,
-	info = vim.log.levels.INFO,
-	warn = vim.log.levels.WARN,
-	error = vim.log.levels.ERROR,
+  debug = vim.log.levels.DEBUG,
+  info = vim.log.levels.INFO,
+  warn = vim.log.levels.WARN,
+  error = vim.log.levels.ERROR,
 }
 
 -- Wrapper that logs to file and optionally to noice
 local function notify(level, msg)
-	if log then
-		log[level](msg)
-	end
-	if M.config.notify_level and levels[level] >= levels[M.config.notify_level] then
-		vim.schedule(function()
-			vim.notify("[run-ai-run] " .. msg, vim_levels[level])
-		end)
-	end
+  if log then
+    log[level](msg)
+  end
+  if M.config.notify_level and levels[level] >= levels[M.config.notify_level] then
+    vim.schedule(function()
+      vim.notify("[run-ai-run] " .. msg, vim_levels[level])
+    end)
+  end
 end
 
 function M.setup(opts)
-	M.config = vim.tbl_deep_extend("force", M.config, opts or {})
+  M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 
-	-- Lazy load dependencies
-	Job = require("plenary.job")
-	spinners = require("noice.util.spinners")
+  spinners = require("noice.util.spinners")
 
-	-- Setup logging
-	log = require("plenary.log").new({
-		plugin = "run-ai-run",
-		level = M.config.log_level,
-		use_console = false,
-		use_file = true,
-	})
+  log = require("plenary.log").new({
+    plugin = "run-ai-run",
+    level = M.config.log_level,
+    use_console = false,
+    use_file = true,
+  })
 
-	-- Validate binary
-	if vim.fn.executable(M.config.bin) ~= 1 then
-		notify("error", "Binary not found: " .. M.config.bin)
-		return
-	end
+  notify("info", "=== run-ai-run loaded ===")
 
-	notify("info", "=== run-ai-run loaded ===")
-	notify("info", "Binary: " .. M.config.bin)
-	notify("info", "Project: " .. M.config.project)
+  vim.api.nvim_create_user_command("Claude", function(args)
+    M.replace(args)
+  end, {
+    range = true,
+    nargs = "*",
+    desc = "Send selection to Claude session",
+  })
 
-	-- Create commands
-	vim.api.nvim_create_user_command("Claude", function(args)
-		M.replace(args)
-	end, {
-		range = true,
-		nargs = "*",
-		desc = "Replace selection with Claude response",
-	})
+  vim.api.nvim_create_user_command("LlmReplace", function(args)
+    M.replace_with_response(args)
+  end, {
+    range = true,
+    nargs = "*",
+    desc = "Replace selection with LLM response",
+  })
 
-	vim.api.nvim_create_user_command("ClaudeContinue", function(args)
-		M.replace(args, { continue = true })
-	end, {
-		range = true,
-		nargs = "*",
-		desc = "Replace selection with Claude response (--continue flag)",
-	})
+  vim.api.nvim_create_user_command("ClaudeSkillClaude", function(args)
+    M.replace(args, {
+      skill = plugin_dir .. "/.claude/skills/run-ai-run.nvim.md",
+    })
+  end, {
+    range = true,
+    nargs = "*",
+    desc = "Send selection to Claude with run-ai-run skill",
+  })
 
-	vim.api.nvim_create_user_command("ClaudeSkillClaude", function(args)
-		M.replace(args, {
-			skill = plugin_dir .. "/.claude/skills/run-ai-run.nvim.md",
-		})
-	end, {
-		range = true,
-		nargs = "*",
-		desc = "Replace selection with Claude using run-ai-run skill",
-	})
+  if M.config.skills_path then
+    M.load_skills(M.config.skills_path)
+  end
 
-	-- Load user skills from skills_path
-	if M.config.skills_path then
-		M.load_skills(M.config.skills_path)
-	end
+  -- Register liter-llm providers
+  if M.config.providers then
+    for _, provider in ipairs(M.config.providers) do
+      local ok, err = pcall(M.liter.register_provider, provider, M.config.lib_path)
+      if ok then
+        notify("info", "Registered provider: " .. provider.name)
+      else
+        notify("error", "Failed to register provider " .. provider.name .. ": " .. tostring(err))
+      end
+    end
+  end
+
+  -- Create shared liter-llm client
+  if M.config.liter then
+    local ok, client = pcall(M.liter.new, M.config.liter, M.config.lib_path)
+    if ok then
+      M.client = client
+      notify("info", "liter-llm client ready (v" .. M.liter.version(M.config.lib_path) .. ")")
+    else
+      notify("error", "Failed to create liter-llm client: " .. tostring(client))
+    end
+  end
 end
 
 --- Load skills from a directory and create commands for each
 ---@param skills_path string Path to the skills directory
 function M.load_skills(skills_path)
-	local path = vim.fn.expand(skills_path)
-	if vim.fn.isdirectory(path) ~= 1 then
-		notify("warn", "Skills path not found: " .. path)
-		return
-	end
+  local path = vim.fn.expand(skills_path)
+  if vim.fn.isdirectory(path) ~= 1 then
+    notify("warn", "Skills path not found: " .. path)
+    return
+  end
 
-	local files = vim.fn.glob(path .. "/*.md", false, true)
-	for _, file in ipairs(files) do
-		local name = vim.fn.fnamemodify(file, ":t:r") -- filename without extension
-		local cmd_name = "ClaudeSkill" .. name:gsub("[^%w]", ""):gsub("^%l", string.upper)
+  local files = vim.fn.glob(path .. "/*.md", false, true)
+  for _, file in ipairs(files) do
+    local name = vim.fn.fnamemodify(file, ":t:r")
+    local cmd_name = "ClaudeSkill" .. name:gsub("[^%w]", ""):gsub("^%l", string.upper)
 
-		vim.api.nvim_create_user_command(cmd_name, function(args)
-			M.replace(args, { skill = file })
-		end, {
-			range = true,
-			nargs = "*",
-			desc = "Replace selection with Claude using " .. name .. " skill",
-		})
+    vim.api.nvim_create_user_command(cmd_name, function(args)
+      M.replace(args, { skill = file })
+    end, {
+      range = true,
+      nargs = "*",
+      desc = "Send selection to Claude using " .. name .. " skill",
+    })
 
-		notify("info", "Loaded skill: " .. name .. " -> :" .. cmd_name)
-	end
+    notify("info", "Loaded skill: " .. name .. " -> :" .. cmd_name)
+  end
 end
 
---- Run Claude with prompt and callbacks (no UI)
+--- Send prompt to the running tmux claude session
 ---@param prompt string The prompt to send
----@param opts? table Options: continue, on_success, on_error, on_stdout, bin, project
----@return table job The plenary job object
+---@param opts? table Options: on_sent, on_error
 function M.run(prompt, opts)
-	opts = opts or {}
-	local cfg = vim.tbl_deep_extend("force", M.config, opts)
+  opts = opts or {}
 
-	local out = {}
+  local kitty_pid = vim.env.KITTY_PID
+  if not kitty_pid then
+    local err = "KITTY_PID not set — not running inside kitty"
+    notify("error", err)
+    if opts.on_error then opts.on_error(err) end
+    return
+  end
 
-	local job_args = { "-p", prompt }
-	if opts.continue then
-		table.insert(job_args, "--continue")
-	end
+  local session = "kitty-" .. kitty_pid
+  notify("info", "Sending to tmux session: " .. session)
+  notify("debug", "Prompt: " .. prompt:sub(1, 100))
 
-	notify("info", "=== Claude Start ===")
-	notify("debug", "Prompt: " .. prompt:sub(1, 100))
+  local escaped = vim.fn.shellescape(prompt)
+  local cmd = string.format("tmux send-keys -t %s %s Enter", vim.fn.shellescape(session), escaped)
 
-	local job = Job:new({
-		command = cfg.bin,
-		args = job_args,
-		cwd = cfg.project,
-		writer = "",
-		on_start = function()
-			notify("debug", "Job started")
-		end,
-		on_stderr = function(_, data)
-			if data and data ~= "" then
-				notify("warn", "stderr: " .. data)
-			end
-		end,
-		on_stdout = function(_, data)
-			if not data or data == "" then
-				return
-			end
+  local ok = os.execute(cmd)
+  if ok ~= 0 and ok ~= true then
+    local err = "Failed to send to tmux session: " .. session
+    notify("error", err)
+    if opts.on_error then opts.on_error(err) end
+    return
+  end
 
-			notify("debug", "stdout: " .. data:sub(1, 100))
-			table.insert(out, data)
-
-			if opts.on_stdout then
-				vim.schedule(function()
-					opts.on_stdout(data)
-				end)
-			end
-		end,
-		on_exit = function(j, code)
-			vim.schedule(function()
-				notify("info", "Exit: " .. code)
-				notify("debug", "Output: " .. #out .. " lines")
-
-				if code ~= 0 then
-					local err = "Failed with code " .. code
-					local stderr = j:stderr_result()
-					if stderr and #stderr > 0 then
-						err = err .. ": " .. table.concat(stderr, "\n")
-					end
-					notify("error", err)
-					if opts.on_error then
-						opts.on_error(err)
-					end
-					return
-				end
-
-				local result = table.concat(out, "\n"):gsub("\n$", "")
-				notify("info", "Success: " .. #out .. " lines")
-
-				if opts.on_success then
-					opts.on_success(result)
-				end
-			end)
-		end,
-	})
-
-	job:start()
-	notify("debug", "Job dispatched")
-	return job
+  notify("info", "Sent to claude session")
+  if opts.on_sent then opts.on_sent() end
 end
 
---- Strip markdown code fences from result if present
----@param text string
----@return string
-local function strip_markdown_fences(text)
-	-- Match ```lang\n...\n``` pattern
-	local stripped = text:match("^```[^\n]*\n(.-)\n```%s*$")
-	if stripped then
-		return stripped
-	end
-	-- Match ```\n...\n``` pattern (no language)
-	stripped = text:match("^```\n(.-)\n```%s*$")
-	if stripped then
-		return stripped
-	end
-	return text
-end
-
---- Replace visual selection with Claude response (with UI)
+--- Replace visual selection with Claude's response
 ---@param args table Command args
----@param opts? table Options: skill (path to skill file), continue (use --continue flag)
-function M.replace(args, opts)
-	opts = opts or {}
+---@param opts? table Options: skill (path to skill file)
+function M.replace_with_response(args, opts)
+  opts = opts or {}
 
-	local query = args.args
-	if query == "" then
-		query = vim.fn.input("Claude: ")
-		if query == "" then
-			return
-		end
-	end
+  local query = args.args
+  if query == "" then
+    query = vim.fn.input("Claude: ")
+    if query == "" then
+      return
+    end
+  end
 
-	-- Get selection positions
-	local s = vim.fn.getpos("'<")
-	local e = vim.fn.getpos("'>")
-	local sl, sc, el, ec = s[2] - 1, s[3] - 1, e[2] - 1, e[3]
+  local s = vim.fn.getpos("'<")
+  local e = vim.fn.getpos("'>")
+  local sl, sc, el, ec = s[2] - 1, s[3] - 1, e[2] - 1, e[3]
 
-	-- Get selected text
-	local lines = vim.api.nvim_buf_get_text(0, sl, sc, el, ec, {})
-	local text = table.concat(lines, "\n")
+  local lines = vim.api.nvim_buf_get_text(0, sl, sc, el, ec, {})
+  local text = table.concat(lines, "\n")
 
-	if text == "" then
-		vim.notify("run-ai-run: no text selected", vim.log.levels.WARN)
-		return
-	end
+  if text == "" then
+    vim.notify("run-ai-run: no text selected", vim.log.levels.WARN)
+    return
+  end
 
-	-- Build prompt with optional skill directive
-	local prompt = query .. "\n\n" .. text
-	if opts.skill then
-		local skill_content = ""
-		local f = io.open(opts.skill, "r")
-		if f then
-			skill_content = f:read("*a")
-			f:close()
-		end
-		if skill_content ~= "" then
-			prompt = "Follow these instructions:\n\n" .. skill_content .. "\n\n---\n\n" .. prompt
-		end
-	end
-	local bufnr = vim.api.nvim_get_current_buf()
+  local prompt = query .. "\n\n" .. text
+  if opts.skill then
+    local f = io.open(opts.skill, "r")
+    if f then
+      local skill_content = f:read("*a")
+      f:close()
+      if skill_content ~= "" then
+        prompt = "Follow these instructions:\n\n" .. skill_content .. "\n\n---\n\n" .. prompt
+      end
+    end
+  end
 
-	-- UI state
-	local running = true
-	local timer = nil
+  local bufnr = vim.api.nvim_get_current_buf()
+  local running = true
+  local timer = nil
+  local hl = M.config.highlight
+  local spinner_type = M.config.spinner
 
-	local hl = M.config.highlight
-	local spinner_type = M.config.spinner
+  local selection_marks = {}
+  for i = sl, el do
+    local line = vim.api.nvim_buf_get_lines(bufnr, i, i + 1, false)[1] or ""
+    local line_len = #line
+    local line_start = (i == sl) and math.min(sc, line_len) or 0
+    local line_end = (i == el) and math.min(ec, line_len) or line_len
+    local mark = vim.api.nvim_buf_set_extmark(bufnr, ns, i, line_start, {
+      end_col = line_end,
+      hl_group = hl,
+    })
+    table.insert(selection_marks, mark)
+  end
 
-	-- Highlight selected text
-	local selection_marks = {}
-	for i = sl, el do
-		local line = vim.api.nvim_buf_get_lines(bufnr, i, i + 1, false)[1] or ""
-		local line_len = #line
-		local line_start = (i == sl) and math.min(sc, line_len) or 0
-		local line_end = (i == el) and math.min(ec, line_len) or line_len
-		local mark = vim.api.nvim_buf_set_extmark(bufnr, ns, i, line_start, {
-			end_col = line_end,
-			hl_group = hl,
-		})
-		table.insert(selection_marks, mark)
-	end
+  local spinner_mark = vim.api.nvim_buf_set_extmark(bufnr, ns, el, 0, {
+    virt_text = { { " " .. spinners.spin(spinner_type) .. " Thinking...", hl } },
+    virt_text_pos = "eol",
+  })
 
-	-- Spinner extmark
-	local spinner_mark = vim.api.nvim_buf_set_extmark(bufnr, ns, el, 0, {
-		virt_text = { { " " .. spinners.spin(spinner_type) .. " Processing...", hl } },
-		virt_text_pos = "eol",
-	})
+  local function cleanup()
+    running = false
+    if timer then
+      timer:stop()
+      timer:close()
+      timer = nil
+    end
+    pcall(vim.api.nvim_buf_del_extmark, bufnr, ns, spinner_mark)
+    for _, mark in ipairs(selection_marks) do
+      pcall(vim.api.nvim_buf_del_extmark, bufnr, ns, mark)
+    end
+  end
 
-	-- Cleanup UI
-	local function cleanup()
-		running = false
-		if timer then
-			timer:stop()
-			timer:close()
-			timer = nil
-		end
-		pcall(vim.api.nvim_buf_del_extmark, bufnr, ns, spinner_mark)
-		for _, mark in ipairs(selection_marks) do
-			pcall(vim.api.nvim_buf_del_extmark, bufnr, ns, mark)
-		end
-	end
+  timer = vim.uv.new_timer()
+  timer:start(0, 80, vim.schedule_wrap(function()
+    if not running or not vim.api.nvim_buf_is_valid(bufnr) then
+      cleanup()
+      return
+    end
+    pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, el, 0, {
+      id = spinner_mark,
+      virt_text = { { " " .. spinners.spin(spinner_type) .. " Thinking...", hl } },
+      virt_text_pos = "eol",
+    })
+  end))
 
-	-- Spinner animation
-	timer = vim.uv.new_timer()
-	timer:start(
-		0,
-		80,
-		vim.schedule_wrap(function()
-			if not running or not vim.api.nvim_buf_is_valid(bufnr) then
-				cleanup()
-				return
-			end
-			pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, el, 0, {
-				id = spinner_mark,
-				virt_text = { { " " .. spinners.spin(spinner_type) .. " Processing...", hl } },
-				virt_text_pos = "eol",
-			})
-		end)
-	)
+  if not M.client then
+    cleanup()
+    vim.notify("run-ai-run: no liter-llm client configured", vim.log.levels.ERROR)
+    return
+  end
 
-	-- Run Claude
-	M.run(prompt, {
-		continue = opts.continue,
-		on_stdout = function(data)
-			if not running or not vim.api.nvim_buf_is_valid(bufnr) then
-				return
-			end
-			local display = data
-			if #display > 50 then
-				display = display:sub(1, 50) .. "..."
-			end
-			pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, el, 0, {
-				id = spinner_mark,
-				virt_text = { { " " .. spinners.spin(spinner_type) .. " " .. display, hl } },
-				virt_text_pos = "eol",
-			})
-		end,
-		on_success = function(result)
-			cleanup()
-			result = strip_markdown_fences(result)
-			local new = vim.split(result, "\n", { plain = true })
-			if vim.api.nvim_buf_is_valid(bufnr) then
-				local end_line = vim.api.nvim_buf_get_lines(bufnr, el, el + 1, false)[1] or ""
-				local end_col = math.min(ec, #end_line)
-				vim.api.nvim_buf_set_text(bufnr, sl, sc, el, end_col, new)
-				notify("info", "Replaced with " .. #new .. " lines")
-			end
-		end,
-		on_error = function(err)
-			cleanup()
-			vim.notify("run-ai-run: " .. err, vim.log.levels.ERROR)
-		end,
-	})
+  local client = M.client
+  vim.schedule_wrap(function()
+    local ok, resp = pcall(client.chat, client, {
+      model = M.config.liter.model or "openai/gpt-4o",
+      messages = { { role = "user", content = prompt } },
+    })
+    vim.schedule(function()
+      cleanup()
+      if not vim.api.nvim_buf_is_valid(bufnr) then return end
+      if ok and resp.choices and resp.choices[1] then
+        local content = resp.choices[1].message.content or ""
+        local result = vim.split(content, "\n")
+        vim.api.nvim_buf_set_text(bufnr, sl, sc, el, ec, result)
+      else
+        vim.notify("run-ai-run: " .. tostring(resp), vim.log.levels.ERROR)
+      end
+    end)
+  end)()
 end
 
---- Create a job (wrapper around plenary.job)
----@param opts table Same options as plenary.job
----@return table job The plenary job object
-function M.job(opts)
-	return Job:new(opts)
+--- Send visual selection with optional prompt and skill to Claude session
+---@param args table Command args
+---@param opts? table Options: skill (path to skill file)
+function M.replace(args, opts)
+  opts = opts or {}
+
+  local query = args.args
+  if query == "" then
+    query = vim.fn.input("Claude: ")
+    if query == "" then
+      return
+    end
+  end
+
+  local s = vim.fn.getpos("'<")
+  local e = vim.fn.getpos("'>")
+  local sl, sc, el, ec = s[2] - 1, s[3] - 1, e[2] - 1, e[3]
+
+  local lines = vim.api.nvim_buf_get_text(0, sl, sc, el, ec, {})
+  local text = table.concat(lines, "\n")
+
+  if text == "" then
+    vim.notify("run-ai-run: no text selected", vim.log.levels.WARN)
+    return
+  end
+
+  local prompt = query .. "\n\n" .. text
+  if opts.skill then
+    local f = io.open(opts.skill, "r")
+    if f then
+      local skill_content = f:read("*a")
+      f:close()
+      if skill_content ~= "" then
+        prompt = "Follow these instructions:\n\n" .. skill_content .. "\n\n---\n\n" .. prompt
+      end
+    end
+  end
+
+  local bufnr = vim.api.nvim_get_current_buf()
+  local running = true
+  local timer = nil
+  local hl = M.config.highlight
+  local spinner_type = M.config.spinner
+
+  local selection_marks = {}
+  for i = sl, el do
+    local line = vim.api.nvim_buf_get_lines(bufnr, i, i + 1, false)[1] or ""
+    local line_len = #line
+    local line_start = (i == sl) and math.min(sc, line_len) or 0
+    local line_end = (i == el) and math.min(ec, line_len) or line_len
+    local mark = vim.api.nvim_buf_set_extmark(bufnr, ns, i, line_start, {
+      end_col = line_end,
+      hl_group = hl,
+    })
+    table.insert(selection_marks, mark)
+  end
+
+  local spinner_mark = vim.api.nvim_buf_set_extmark(bufnr, ns, el, 0, {
+    virt_text = { { " " .. spinners.spin(spinner_type) .. " Sending...", hl } },
+    virt_text_pos = "eol",
+  })
+
+  local function cleanup()
+    running = false
+    if timer then
+      timer:stop()
+      timer:close()
+      timer = nil
+    end
+    pcall(vim.api.nvim_buf_del_extmark, bufnr, ns, spinner_mark)
+    for _, mark in ipairs(selection_marks) do
+      pcall(vim.api.nvim_buf_del_extmark, bufnr, ns, mark)
+    end
+  end
+
+  timer = vim.uv.new_timer()
+  timer:start(0, 80, vim.schedule_wrap(function()
+    if not running or not vim.api.nvim_buf_is_valid(bufnr) then
+      cleanup()
+      return
+    end
+    pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, el, 0, {
+      id = spinner_mark,
+      virt_text = { { " " .. spinners.spin(spinner_type) .. " Sending...", hl } },
+      virt_text_pos = "eol",
+    })
+  end))
+
+  M.run(prompt, {
+    on_sent = function()
+      cleanup()
+      if M.config.on_sent then M.config.on_sent() end
+    end,
+    on_error = function(err)
+      cleanup()
+      vim.notify("run-ai-run: " .. err, vim.log.levels.ERROR)
+    end,
+  })
 end
 
 return M
