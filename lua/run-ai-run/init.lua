@@ -29,6 +29,11 @@ M.config = {
   --- Path to liter-llm shared library (auto-detected if nil)
   ---@type string?
   lib_path = nil,
+
+  --- URL to download the platform shared library when not bundled or cached.
+  --- Used by :LiterInstall
+  ---@type string?
+  download_url = nil,
 }
 
 --- Shared liter-llm client instance, created during setup if config.liter is set
@@ -103,12 +108,36 @@ function M.setup(opts)
     M.load_skills(M.config.skills_path)
   end
 
+  -- :LiterInstall — download the shared library with a progress float
+  vim.api.nvim_create_user_command("LiterInstall", function()
+    local url = M.config.download_url
+    if not url then
+      vim.notify("[run-ai-run] Set config.download_url to enable :LiterInstall", vim.log.levels.ERROR)
+      return
+    end
+    M.liter.ensure(url, function()
+      vim.notify("[run-ai-run] liter-llm library installed. Re-run setup or restart Neovim.", vim.log.levels.INFO)
+      -- Retry client creation if config.liter is set
+      if M.config.liter then
+        local ok, client = pcall(M.liter.new, M.config.liter, M.config.lib_path)
+        if ok then
+          M.client = client
+          notify("info", "liter-llm client ready (v" .. M.liter.version(M.config.lib_path) .. ")")
+        end
+      end
+    end, function(err)
+      vim.notify("[run-ai-run] " .. err, vim.log.levels.ERROR)
+    end)
+  end, { desc = "Download liter-llm shared library" })
+
   -- Register liter-llm providers
   if M.config.providers then
     for _, provider in ipairs(M.config.providers) do
       local ok, err = pcall(M.liter.register_provider, provider, M.config.lib_path)
       if ok then
         notify("info", "Registered provider: " .. provider.name)
+      elseif tostring(err):find("not found") then
+        -- library missing — warning already shown during client creation
       else
         notify("error", "Failed to register provider " .. provider.name .. ": " .. tostring(err))
       end
@@ -121,6 +150,11 @@ function M.setup(opts)
     if ok then
       M.client = client
       notify("info", "liter-llm client ready (v" .. M.liter.version(M.config.lib_path) .. ")")
+    elseif tostring(client):find("not found") then
+      vim.notify(
+        "[run-ai-run] liter-llm library not found.\nRun :LiterInstall to download it.",
+        vim.log.levels.WARN
+      )
     else
       notify("error", "Failed to create liter-llm client: " .. tostring(client))
     end
